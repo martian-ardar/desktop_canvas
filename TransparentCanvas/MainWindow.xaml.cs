@@ -7,6 +7,8 @@ using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Media.Imaging;
+using System.Windows.Threading;
+using TransparentCanvas.Controls;
 using TransparentCanvas.Models;
 using TransparentCanvas.Services;
 
@@ -27,9 +29,15 @@ public partial class MainWindow : Window
     // OneNote 服务
     private readonly OneNoteService _oneNoteService = new();
     
+    // 本地存储服务
+    private readonly LocalStorageService _localStorageService = new();
+
     // 撤销历史
     private readonly Stack<UndoAction> _undoStack = new();
     private bool _isUndoing = false;
+
+    // 日程提醒定时器
+    private readonly DispatcherTimer _reminderCheckTimer;
 
     public MainWindow()
     {
@@ -47,6 +55,14 @@ public partial class MainWindow : Window
         // 应用圆角裁剪
         this.Loaded += MainWindow_Loaded;
         this.SizeChanged += MainWindow_SizeChanged;
+
+        // 启动日程提醒检查定时器（每秒检查一次）
+        _reminderCheckTimer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromSeconds(1)
+        };
+        _reminderCheckTimer.Tick += ReminderCheckTimer_Tick;
+        _reminderCheckTimer.Start();
     }
 
     /// <summary>
@@ -260,20 +276,65 @@ public partial class MainWindow : Window
     /// </summary>
     private void InitializePages()
     {
-        // 创建第一个页面
-        CreateNewPage();
+        // 从本地存储加载已保存的日程提醒笔记
+        var savedPages = _localStorageService.LoadAllPages();
+        if (savedPages.Count > 0)
+        {
+            foreach (var page in savedPages)
+            {
+                _pages.Add(page);
+            }
+            // 切换到第一个加载的页面
+            SwitchToPage(_pages[0]);
+            RefreshPageTabs();
+        }
+        else
+        {
+            // 没有保存的页面，创建第一个默认页面（不弹对话框）
+            CreateDefaultPage();
+        }
     }
 
     /// <summary>
-    /// 创建新页面
+    /// 创建新页面（显示类型选择对话框）
     /// </summary>
     private void CreateNewPage()
+    {
+        var noteType = ShowNoteTypeDialog();
+        if (noteType == null) return; // 用户取消
+
+        if (noteType == NoteType.ScheduleReminder)
+        {
+            CreateNewSchedulePage();
+        }
+        else
+        {
+            CreateNewPageWithType(NoteType.Normal);
+        }
+    }
+
+    /// <summary>
+    /// 初始化时创建默认页面（不弹对话框）
+    /// </summary>
+    private void CreateDefaultPage()
+    {
+        CreateNewPageWithType(NoteType.Normal);
+    }
+
+    /// <summary>
+    /// 创建指定类型的新页面
+    /// </summary>
+    private void CreateNewPageWithType(NoteType noteType, DateTime? targetTime = null)
     {
         // 保存当前页面状态
         SaveCurrentPageState();
 
         // 创建新页面
-        var newPage = new PageData();
+        var newPage = new PageData(noteType: noteType);
+        if (targetTime.HasValue)
+        {
+            newPage.TargetTime = targetTime.Value;
+        }
         _pages.Add(newPage);
         
         // 切换到新页面
@@ -281,6 +342,334 @@ public partial class MainWindow : Window
         
         // 刷新标签栏
         RefreshPageTabs();
+
+        // 如果是日程提醒类笔记，立即保存到本地并刷新底部提醒栏
+        if (noteType == NoteType.ScheduleReminder)
+        {
+            _localStorageService.SavePageData(newPage);
+            UpdateScheduleBar();
+        }
+    }
+
+    /// <summary>
+    /// 显示笔记类型选择对话框
+    /// </summary>
+    private NoteType? ShowNoteTypeDialog()
+    {
+        NoteType? result = null;
+
+        var dialog = new Window
+        {
+            Title = "选择笔记类型",
+            Width = 360,
+            Height = 220,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Owner = this,
+            ResizeMode = ResizeMode.NoResize,
+            WindowStyle = WindowStyle.ToolWindow,
+            Background = new SolidColorBrush(Color.FromRgb(0x2D, 0x2D, 0x30)),
+        };
+
+        var grid = new Grid { Margin = new Thickness(24) };
+        grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+
+        var title = new TextBlock
+        {
+            Text = "请选择笔记类型：",
+            Foreground = new SolidColorBrush(Colors.White),
+            FontSize = 14,
+            Margin = new Thickness(0, 0, 0, 16)
+        };
+        Grid.SetRow(title, 0);
+        grid.Children.Add(title);
+
+        var buttonPanel = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+
+        // 普通笔记按钮
+        var normalBtn = CreateTypeButton("📝", "普通笔记", "可保存到 OneNote");
+        normalBtn.Click += (s, e) =>
+        {
+            result = NoteType.Normal;
+            dialog.DialogResult = true;
+        };
+        buttonPanel.Children.Add(normalBtn);
+
+        // 间距
+        buttonPanel.Children.Add(new Border { Width = 20 });
+
+        // 日程提醒按钮
+        var scheduleBtn = CreateTypeButton("⏰", "日程提醒", "到期弹窗提醒");
+        scheduleBtn.Click += (s, e) =>
+        {
+            result = NoteType.ScheduleReminder;
+            dialog.DialogResult = true;
+        };
+        buttonPanel.Children.Add(scheduleBtn);
+
+        Grid.SetRow(buttonPanel, 1);
+        grid.Children.Add(buttonPanel);
+
+        dialog.Content = grid;
+        dialog.ShowDialog();
+
+        return result;
+    }
+
+    /// <summary>
+    /// 创建类型选择按钮
+    /// </summary>
+    private Button CreateTypeButton(string icon, string label, string desc)
+    {
+        var btn = new Button
+        {
+            Width = 130,
+            Height = 110,
+            Background = new SolidColorBrush(Color.FromRgb(0x3C, 0x3C, 0x3C)),
+            BorderBrush = new SolidColorBrush(Color.FromRgb(0x55, 0x55, 0x55)),
+            BorderThickness = new Thickness(1),
+            Cursor = Cursors.Hand
+        };
+
+        btn.Template = CreateTypeButtonTemplate();
+
+        var panel = new StackPanel
+        {
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+
+        panel.Children.Add(new TextBlock
+        {
+            Text = icon,
+            FontSize = 32,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            Margin = new Thickness(0, 0, 0, 6)
+        });
+
+        panel.Children.Add(new TextBlock
+        {
+            Text = label,
+            Foreground = new SolidColorBrush(Colors.White),
+            FontSize = 14,
+            FontWeight = FontWeights.SemiBold,
+            HorizontalAlignment = HorizontalAlignment.Center
+        });
+
+        panel.Children.Add(new TextBlock
+        {
+            Text = desc,
+            Foreground = new SolidColorBrush(Color.FromRgb(0x99, 0x99, 0x99)),
+            FontSize = 10,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            Margin = new Thickness(0, 2, 0, 0)
+        });
+
+        btn.Content = panel;
+        return btn;
+    }
+
+    private ControlTemplate CreateTypeButtonTemplate()
+    {
+        var template = new ControlTemplate(typeof(Button));
+        var border = new FrameworkElementFactory(typeof(Border));
+        border.SetValue(Border.BackgroundProperty, new SolidColorBrush(Color.FromRgb(0x3C, 0x3C, 0x3C)));
+        border.SetValue(Border.BorderBrushProperty, new SolidColorBrush(Color.FromRgb(0x55, 0x55, 0x55)));
+        border.SetValue(Border.BorderThicknessProperty, new Thickness(1));
+        border.SetValue(Border.CornerRadiusProperty, new CornerRadius(8));
+        border.Name = "border";
+
+        var presenter = new FrameworkElementFactory(typeof(ContentPresenter));
+        presenter.SetValue(ContentPresenter.HorizontalAlignmentProperty, HorizontalAlignment.Center);
+        presenter.SetValue(ContentPresenter.VerticalAlignmentProperty, VerticalAlignment.Center);
+        border.AppendChild(presenter);
+
+        template.VisualTree = border;
+
+        // Hover 触发器
+        var trigger = new Trigger
+        {
+            Property = UIElement.IsMouseOverProperty,
+            Value = true
+        };
+        trigger.Setters.Add(new Setter(Border.BackgroundProperty, new SolidColorBrush(Color.FromRgb(0x0, 0x78, 0xD4)), "border"));
+        trigger.Setters.Add(new Setter(Border.BorderBrushProperty, new SolidColorBrush(Color.FromRgb(0x0, 0x78, 0xD4)), "border"));
+        template.Triggers.Add(trigger);
+
+        return template;
+    }
+
+    /// <summary>
+    /// 创建日程提醒页面（含时间选择）
+    /// </summary>
+    private void CreateNewSchedulePage()
+    {
+        var dialog = new Window
+        {
+            Title = "设置提醒时间",
+            Width = 380,
+            Height = 260,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Owner = this,
+            ResizeMode = ResizeMode.NoResize,
+            WindowStyle = WindowStyle.ToolWindow,
+            Background = new SolidColorBrush(Color.FromRgb(0x2D, 0x2D, 0x30)),
+        };
+
+        var grid = new Grid { Margin = new Thickness(24) };
+        grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+        // 标题
+        var titleLabel = new TextBlock
+        {
+            Text = "笔记标题：",
+            Foreground = new SolidColorBrush(Colors.White),
+            FontSize = 12,
+            Margin = new Thickness(0, 0, 0, 4)
+        };
+        Grid.SetRow(titleLabel, 0);
+        grid.Children.Add(titleLabel);
+
+        var titleBox = new TextBox
+        {
+            Text = $"提醒 {PageData._nextIdPreview}",
+            Padding = new Thickness(6, 4, 6, 4),
+            Margin = new Thickness(0, 0, 0, 12),
+            FontSize = 13
+        };
+        Grid.SetRow(titleBox, 1);
+        grid.Children.Add(titleBox);
+
+        // 日期选择
+        var dateLabel = new TextBlock
+        {
+            Text = "提醒日期：",
+            Foreground = new SolidColorBrush(Colors.White),
+            FontSize = 12,
+            Margin = new Thickness(0, 0, 0, 4)
+        };
+        Grid.SetRow(dateLabel, 2);
+        grid.Children.Add(dateLabel);
+
+        var dateTimePanel = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Margin = new Thickness(0, 0, 0, 16)
+        };
+
+        var datePicker = new DatePicker
+        {
+            SelectedDate = DateTime.Today,
+            Width = 160,
+            FontSize = 13
+        };
+        dateTimePanel.Children.Add(datePicker);
+
+        dateTimePanel.Children.Add(new TextBlock
+        {
+            Text = "  时间：",
+            Foreground = new SolidColorBrush(Colors.White),
+            FontSize = 12,
+            VerticalAlignment = VerticalAlignment.Center
+        });
+
+        var hourBox = new TextBox
+        {
+            Text = DateTime.Now.Hour.ToString("D2"),
+            Width = 40,
+            FontSize = 13,
+            TextAlignment = TextAlignment.Center,
+            Padding = new Thickness(4, 4, 4, 4)
+        };
+        dateTimePanel.Children.Add(hourBox);
+
+        dateTimePanel.Children.Add(new TextBlock
+        {
+            Text = " : ",
+            Foreground = new SolidColorBrush(Colors.White),
+            FontSize = 14,
+            VerticalAlignment = VerticalAlignment.Center
+        });
+
+        var minuteBox = new TextBox
+        {
+            Text = "00",
+            Width = 40,
+            FontSize = 13,
+            TextAlignment = TextAlignment.Center,
+            Padding = new Thickness(4, 4, 4, 4)
+        };
+        dateTimePanel.Children.Add(minuteBox);
+
+        Grid.SetRow(dateTimePanel, 3);
+        grid.Children.Add(dateTimePanel);
+
+        // 按钮
+        var buttonPanel = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            HorizontalAlignment = HorizontalAlignment.Right
+        };
+
+        var okButton = new Button
+        {
+            Content = "确定",
+            Width = 80,
+            Height = 30,
+            Margin = new Thickness(0, 0, 10, 0),
+            IsDefault = true
+        };
+        okButton.Click += (s, e) =>
+        {
+            if (datePicker.SelectedDate.HasValue &&
+                int.TryParse(hourBox.Text, out var hour) && hour >= 0 && hour <= 23 &&
+                int.TryParse(minuteBox.Text, out var minute) && minute >= 0 && minute <= 59)
+            {
+                var targetTime = datePicker.SelectedDate.Value.Date
+                    .AddHours(hour).AddMinutes(minute);
+
+                CreateNewPageWithType(NoteType.ScheduleReminder, targetTime);
+
+                // 如果用户输入了自定义标题
+                if (!string.IsNullOrWhiteSpace(titleBox.Text))
+                {
+                    _currentPage!.Title = titleBox.Text.Trim();
+                    RefreshPageTabs();
+                }
+
+                dialog.DialogResult = true;
+            }
+            else
+            {
+                MessageBox.Show("请输入有效的日期和时间（小时 0-23，分钟 0-59）", "输入错误",
+                    MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+        };
+        buttonPanel.Children.Add(okButton);
+
+        var cancelButton = new Button
+        {
+            Content = "取消",
+            Width = 80,
+            Height = 30,
+            IsCancel = true
+        };
+        buttonPanel.Children.Add(cancelButton);
+
+        Grid.SetRow(buttonPanel, 4);
+        grid.Children.Add(buttonPanel);
+
+        dialog.Content = grid;
+        dialog.ShowDialog();
     }
 
     /// <summary>
@@ -291,6 +680,12 @@ public partial class MainWindow : Window
         if (_currentPage != null)
         {
             _currentPage.SaveFromCanvas(inkCanvas);
+
+            // 日程提醒类笔记自动保存到本地
+            if (_currentPage.NoteType == NoteType.ScheduleReminder)
+            {
+                _localStorageService.SavePageData(_currentPage);
+            }
         }
     }
 
@@ -310,6 +705,10 @@ public partial class MainWindow : Window
 
         // 刷新标签栏高亮
         RefreshPageTabs();
+
+        // 更新日程提醒栏和 OneNote 按钮状态
+        UpdateScheduleBar();
+        UpdateOneNoteButtonVisibility();
     }
 
     /// <summary>
@@ -322,6 +721,29 @@ public partial class MainWindow : Window
         {
             MessageBox.Show("至少需要保留一个页面", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
             return;
+        }
+
+        // 如果是日程提醒类笔记，询问是否删除本地存储
+        if (page.NoteType == NoteType.ScheduleReminder)
+        {
+            var result = ShowCloseReminderDialog(page.Title);
+
+            if (result == null) // 取消
+                return;
+
+            if (result == true) // 删除
+            {
+                _localStorageService.DeletePage(page);
+            }
+            else // 保留
+            {
+                // 选择保留 → 先保存最新状态
+                if (page == _currentPage)
+                {
+                    page.SaveFromCanvas(inkCanvas);
+                }
+                _localStorageService.SavePageData(page);
+            }
         }
 
         var pageIndex = _pages.IndexOf(page);
@@ -338,6 +760,175 @@ public partial class MainWindow : Window
         {
             RefreshPageTabs();
         }
+    }
+
+    /// <summary>
+    /// 显示关闭日程提醒的自定义对话框
+    /// 返回: true=删除, false=保留, null=取消
+    /// </summary>
+    private bool? ShowCloseReminderDialog(string pageTitle)
+    {
+        bool? result = null;
+
+        var dialog = new Window
+        {
+            Width = 420,
+            Height = 240,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Owner = this,
+            ResizeMode = ResizeMode.NoResize,
+            WindowStyle = WindowStyle.None,
+            AllowsTransparency = true,
+            Background = Brushes.Transparent,
+        };
+
+        var outerBorder = new Border
+        {
+            Background = new SolidColorBrush(Color.FromRgb(0x2D, 0x2D, 0x30)),
+            BorderBrush = new SolidColorBrush(Color.FromRgb(0x0, 0x78, 0xD4)),
+            BorderThickness = new Thickness(1.5),
+            CornerRadius = new CornerRadius(10),
+            Effect = new System.Windows.Media.Effects.DropShadowEffect
+            {
+                Color = Color.FromRgb(0x0, 0x78, 0xD4),
+                BlurRadius = 20,
+                ShadowDepth = 0,
+                Opacity = 0.3
+            }
+        };
+
+        var rootGrid = new Grid { Margin = new Thickness(24, 20, 24, 20) };
+        rootGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // icon + title
+        rootGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) }); // message
+        rootGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // buttons
+
+        // ── 顶部：图标 + 标题 ──
+        var headerPanel = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            Margin = new Thickness(0, 0, 0, 14)
+        };
+        headerPanel.Children.Add(new TextBlock
+        {
+            Text = "⏰",
+            FontSize = 22,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(0, 0, 8, 0)
+        });
+        headerPanel.Children.Add(new TextBlock
+        {
+            Text = "关闭日程提醒",
+            Foreground = new SolidColorBrush(Color.FromRgb(0x0, 0x78, 0xD4)),
+            FontSize = 17,
+            FontWeight = FontWeights.Bold,
+            VerticalAlignment = VerticalAlignment.Center
+        });
+        Grid.SetRow(headerPanel, 0);
+        rootGrid.Children.Add(headerPanel);
+
+        // ── 中间：消息正文 ──
+        var msgPanel = new StackPanel
+        {
+            VerticalAlignment = VerticalAlignment.Center,
+            HorizontalAlignment = HorizontalAlignment.Center
+        };
+        msgPanel.Children.Add(new TextBlock
+        {
+            Text = $"确定关闭提醒 \"{pageTitle}\" ？",
+            Foreground = new SolidColorBrush(Colors.White),
+            FontSize = 14,
+            FontWeight = FontWeights.SemiBold,
+            TextWrapping = TextWrapping.Wrap,
+            TextAlignment = TextAlignment.Center,
+            Margin = new Thickness(0, 0, 0, 6)
+        });
+        msgPanel.Children.Add(new TextBlock
+        {
+            Text = "您可以选择彻底删除数据，或保留以便下次启动时恢复。",
+            Foreground = new SolidColorBrush(Color.FromRgb(0x99, 0x99, 0x99)),
+            FontSize = 12,
+            TextWrapping = TextWrapping.Wrap,
+            TextAlignment = TextAlignment.Center
+        });
+        Grid.SetRow(msgPanel, 1);
+        rootGrid.Children.Add(msgPanel);
+
+        // ── 底部：三个按钮 ──
+        var btnPanel = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            Margin = new Thickness(0, 14, 0, 0)
+        };
+
+        Button MakeBtn(string text, SolidColorBrush bg, SolidColorBrush hoverBg, SolidColorBrush fg, double width = 100)
+        {
+            var btn = new Button
+            {
+                Content = text,
+                Width = width,
+                Height = 34,
+                Foreground = fg,
+                FontSize = 13,
+                Cursor = Cursors.Hand,
+                Margin = new Thickness(6, 0, 6, 0)
+            };
+
+            var tpl = new ControlTemplate(typeof(Button));
+            var bd = new FrameworkElementFactory(typeof(Border));
+            bd.SetValue(Border.BackgroundProperty, bg);
+            bd.SetValue(Border.CornerRadiusProperty, new CornerRadius(6));
+            bd.Name = "btnBorder";
+            var cp = new FrameworkElementFactory(typeof(ContentPresenter));
+            cp.SetValue(ContentPresenter.HorizontalAlignmentProperty, HorizontalAlignment.Center);
+            cp.SetValue(ContentPresenter.VerticalAlignmentProperty, VerticalAlignment.Center);
+            bd.AppendChild(cp);
+            tpl.VisualTree = bd;
+
+            var hoverTrigger = new Trigger { Property = UIElement.IsMouseOverProperty, Value = true };
+            hoverTrigger.Setters.Add(new Setter(Border.BackgroundProperty, hoverBg, "btnBorder"));
+            tpl.Triggers.Add(hoverTrigger);
+
+            btn.Template = tpl;
+            return btn;
+        }
+
+        // 删除按钮（危险操作 — 红色系）
+        var deleteBtn = MakeBtn("🗑 彻底删除",
+            new SolidColorBrush(Color.FromRgb(0x6B, 0x2D, 0x2D)),
+            new SolidColorBrush(Color.FromRgb(0xC4, 0x3E, 0x3E)),
+            new SolidColorBrush(Colors.White), 110);
+        deleteBtn.Click += (s, e) => { result = true; dialog.DialogResult = true; };
+        btnPanel.Children.Add(deleteBtn);
+
+        // 保留按钮（安全操作 — 蓝色）
+        var keepBtn = MakeBtn("💾 保留数据",
+            new SolidColorBrush(Color.FromRgb(0x0, 0x78, 0xD4)),
+            new SolidColorBrush(Color.FromRgb(0x1A, 0x8F, 0xE8)),
+            new SolidColorBrush(Colors.White), 110);
+        keepBtn.Click += (s, e) => { result = false; dialog.DialogResult = true; };
+        btnPanel.Children.Add(keepBtn);
+
+        // 取消按钮
+        var cancelBtn = MakeBtn("取消",
+            new SolidColorBrush(Color.FromRgb(0x3C, 0x3C, 0x3C)),
+            new SolidColorBrush(Color.FromRgb(0x55, 0x55, 0x55)),
+            new SolidColorBrush(Color.FromRgb(0xCC, 0xCC, 0xCC)), 80);
+        cancelBtn.Click += (s, e) => { result = null; dialog.DialogResult = false; };
+        btnPanel.Children.Add(cancelBtn);
+
+        Grid.SetRow(btnPanel, 2);
+        rootGrid.Children.Add(btnPanel);
+
+        outerBorder.Child = rootGrid;
+        dialog.Content = outerBorder;
+
+        // 允许拖动
+        outerBorder.MouseLeftButtonDown += (s, e) => { dialog.DragMove(); };
+
+        dialog.ShowDialog();
+        return result;
     }
 
     /// <summary>
@@ -374,6 +965,19 @@ public partial class MainWindow : Window
         {
             Orientation = Orientation.Horizontal
         };
+
+        // 笔记类型图标
+        if (page.NoteType == NoteType.ScheduleReminder)
+        {
+            var iconText = new TextBlock
+            {
+                Text = "⏰",
+                VerticalAlignment = VerticalAlignment.Center,
+                FontSize = 10,
+                Margin = new Thickness(0, 0, 4, 0)
+            };
+            stackPanel.Children.Add(iconText);
+        }
 
         // 页面标题
         var titleText = new TextBlock
@@ -537,11 +1141,64 @@ public partial class MainWindow : Window
     #region OneNote 集成
 
     /// <summary>
-    /// 保存到 OneNote 按钮点击
+    /// 保存按钮点击（日程提醒→本地，普通→OneNote）
     /// </summary>
     private async void SaveToOneNoteButton_Click(object sender, RoutedEventArgs e)
     {
-        await SaveCurrentPageToOneNote();
+        if (_currentPage?.NoteType == NoteType.ScheduleReminder)
+        {
+            SaveCurrentReminderToLocal();
+        }
+        else
+        {
+            await SaveCurrentPageToOneNote();
+        }
+    }
+
+    /// <summary>
+    /// 保存当前日程提醒笔记到本地
+    /// </summary>
+    private void SaveCurrentReminderToLocal()
+    {
+        if (_currentPage == null || _currentPage.NoteType != NoteType.ScheduleReminder)
+            return;
+
+        _localStorageService.SavePage(_currentPage, inkCanvas);
+
+        // 短暂显示保存提示
+        SaveToOneNoteButton.Content = "✅";
+        SaveToOneNoteButton.IsEnabled = false;
+
+        var timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+        timer.Tick += (s, e) =>
+        {
+            timer.Stop();
+            UpdateSaveButtonForCurrentPage();
+        };
+        timer.Start();
+    }
+
+    /// <summary>
+    /// 根据当前页面类型更新保存按钮显示
+    /// </summary>
+    private void UpdateSaveButtonForCurrentPage()
+    {
+        if (_currentPage == null) return;
+
+        if (_currentPage.NoteType == NoteType.ScheduleReminder)
+        {
+            SaveToOneNoteButton.Content = "💾";
+            SaveToOneNoteButton.ToolTip = "保存到本地 (Ctrl+S)";
+            SaveToOneNoteButton.IsEnabled = true;
+            SaveToOneNoteButton.Opacity = 1.0;
+        }
+        else
+        {
+            SaveToOneNoteButton.Content = "💾";
+            SaveToOneNoteButton.ToolTip = "保存到 OneNote (Ctrl+S)";
+            SaveToOneNoteButton.IsEnabled = true;
+            SaveToOneNoteButton.Opacity = 1.0;
+        }
     }
 
     /// <summary>
@@ -550,6 +1207,15 @@ public partial class MainWindow : Window
     private async Task SaveCurrentPageToOneNote()
     {
         if (_currentPage == null) return;
+
+        // 日程提醒类笔记不可以保存到 OneNote
+        if (_currentPage.NoteType == NoteType.ScheduleReminder)
+        {
+            MessageBox.Show("日程提醒类笔记不支持保存到 OneNote，已自动保存到本地。", "提示",
+                MessageBoxButton.OK, MessageBoxImage.Information);
+            SaveCurrentReminderToLocal();
+            return;
+        }
 
         // 禁用按钮防止重复点击
         SaveToOneNoteButton.IsEnabled = false;
@@ -571,6 +1237,14 @@ public partial class MainWindow : Window
             SaveToOneNoteButton.IsEnabled = true;
             SaveToOneNoteButton.Content = "💾";
         }
+    }
+
+    /// <summary>
+    /// 根据当前页面类型更新保存按钮可见性
+    /// </summary>
+    private void UpdateOneNoteButtonVisibility()
+    {
+        UpdateSaveButtonForCurrentPage();
     }
 
     #endregion
@@ -617,7 +1291,26 @@ public partial class MainWindow : Window
     /// </summary>
     private void CloseButton_Click(object sender, RoutedEventArgs e)
     {
+        // 关闭前保存所有日程提醒类笔记
+        SaveAllReminderPages();
         Close();
+    }
+
+    /// <summary>
+    /// 保存所有日程提醒类笔记到本地
+    /// </summary>
+    private void SaveAllReminderPages()
+    {
+        // 先保存当前页面到内存
+        SaveCurrentPageState();
+
+        foreach (var page in _pages)
+        {
+            if (page.NoteType == NoteType.ScheduleReminder)
+            {
+                _localStorageService.SavePageData(page);
+            }
+        }
     }
 
     #endregion
@@ -1132,6 +1825,77 @@ public partial class MainWindow : Window
 
     #endregion
 
+    #region 日程提醒
+
+    /// <summary>
+    /// 日程提醒检查定时器（每秒检查一次）
+    /// </summary>
+    private void ReminderCheckTimer_Tick(object? sender, EventArgs e)
+    {
+        var now = DateTime.Now;
+
+        foreach (var page in _pages)
+        {
+            if (page.NoteType == NoteType.ScheduleReminder &&
+                page.TargetTime.HasValue &&
+                !page.HasReminded &&
+                now >= page.TargetTime.Value)
+            {
+                page.HasReminded = true;
+                ShowReminderPopup(page);
+            }
+        }
+
+        // 更新当前页面的倒计时显示
+        UpdateScheduleBar();
+    }
+
+    /// <summary>
+    /// 显示提醒弹窗
+    /// </summary>
+    private void ShowReminderPopup(PageData page)
+    {
+        var reminderWindow = new ReminderWindow(page.Title, page.TargetTime!.Value);
+        reminderWindow.Show();
+
+        // 闪烁任务栏
+        this.Activate();
+    }
+
+    /// <summary>
+    /// 更新日程提醒栏显示
+    /// </summary>
+    private void UpdateScheduleBar()
+    {
+        if (_currentPage == null) return;
+
+        if (_currentPage.NoteType == NoteType.ScheduleReminder && _currentPage.TargetTime.HasValue)
+        {
+            ScheduleBarBorder.Visibility = Visibility.Visible;
+
+            var remaining = _currentPage.TargetTime.Value - DateTime.Now;
+            if (remaining.TotalSeconds > 0)
+            {
+                var days = remaining.Days > 0 ? $"{remaining.Days}天 " : "";
+                ScheduleTimeText.Text = $"⏰ 提醒时间: {_currentPage.TargetTime.Value:yyyy-MM-dd HH:mm}  |  剩余: {days}{remaining.Hours:D2}:{remaining.Minutes:D2}:{remaining.Seconds:D2}";
+                ScheduleTimeText.Foreground = remaining.TotalMinutes <= 5
+                    ? new SolidColorBrush(Color.FromRgb(0xE7, 0x4C, 0x3C))
+                    : new SolidColorBrush(Color.FromRgb(0xFF, 0xD7, 0x00));
+            }
+            else
+            {
+                ScheduleTimeText.Text = $"⏰ 提醒时间: {_currentPage.TargetTime.Value:yyyy-MM-dd HH:mm}  |  ⚠️ 已到期！";
+                ScheduleTimeText.Foreground = new SolidColorBrush(Color.FromRgb(0xE7, 0x4C, 0x3C));
+            }
+        }
+        else
+        {
+            ScheduleBarBorder.Visibility = Visibility.Collapsed;
+        }
+    }
+
+    #endregion
+
     #region 键盘快捷键
 
     /// <summary>
@@ -1163,10 +1927,17 @@ public partial class MainWindow : Window
             CreateNewPage();
             e.Handled = true;
         }
-        // Ctrl+S 保存到 OneNote
+        // Ctrl+S 保存（日程提醒→本地，普通→OneNote）
         else if (e.Key == Key.S && Keyboard.Modifiers == ModifierKeys.Control)
         {
-            await SaveCurrentPageToOneNote();
+            if (_currentPage?.NoteType == NoteType.ScheduleReminder)
+            {
+                SaveCurrentReminderToLocal();
+            }
+            else
+            {
+                await SaveCurrentPageToOneNote();
+            }
             e.Handled = true;
         }
         // Ctrl+W 关闭当前页面

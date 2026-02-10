@@ -36,4 +36,3 @@ public class OneNoteConfig
     public string NotebookName { get; set; } = string.Empty;
     public string SectionName { get; set; } = string.Empty;
 }
-

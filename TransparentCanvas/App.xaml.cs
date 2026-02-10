@@ -10,4 +10,3 @@ namespace TransparentCanvas;
 public partial class App : Application
 {
 }
-

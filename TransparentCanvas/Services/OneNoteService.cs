@@ -19,30 +19,51 @@ namespace TransparentCanvas.Services;
 /// </summary>
 public class OneNoteService
 {
-    private readonly IPublicClientApplication _app;
-    private readonly AppConfig _config;
+    private IPublicClientApplication? _app;
+    private AppConfig? _config;
     private readonly string[] _scopes = { "Notes.ReadWrite" };
     private string? _accessToken;
+    private bool _initialized = false;
 
     public OneNoteService()
     {
+        // 延迟初始化，避免配置为空时启动崩溃
+    }
+
+    /// <summary>
+    /// 确保服务已初始化
+    /// </summary>
+    private bool EnsureInitialized()
+    {
+        if (_initialized) return _app != null;
+        _initialized = true;
+
         try
         {
             _config = AppConfig.Load();
+
+            if (string.IsNullOrWhiteSpace(_config.AzureAd.ClientId) ||
+                string.IsNullOrWhiteSpace(_config.AzureAd.TenantId))
+            {
+                MessageBox.Show("请先在 appsettings.json 中配置 AzureAd 的 ClientId 和 TenantId",
+                    "OneNote 配置缺失", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return false;
+            }
+
+            _app = PublicClientApplicationBuilder
+                .Create(_config.AzureAd.ClientId)
+                .WithAuthority($"https://login.microsoftonline.com/{_config.AzureAd.TenantId}")
+                .WithDefaultRedirectUri()
+                .Build();
+
+            TokenCacheHelper.EnableSerialization(_app.UserTokenCache);
+            return true;
         }
         catch (Exception ex)
         {
-            MessageBox.Show($"配置文件加载失败: {ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
-            throw;
+            MessageBox.Show($"OneNote 服务初始化失败: {ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
+            return false;
         }
-
-        _app = PublicClientApplicationBuilder
-            .Create(_config.AzureAd.ClientId)
-            .WithAuthority($"https://login.microsoftonline.com/{_config.AzureAd.TenantId}")
-            .WithDefaultRedirectUri()
-            .Build();
-
-        TokenCacheHelper.EnableSerialization(_app.UserTokenCache);
     }
 
     /// <summary>
@@ -50,6 +71,9 @@ public class OneNoteService
     /// </summary>
     public async Task<bool> AuthenticateAsync()
     {
+        if (!EnsureInitialized() || _app == null)
+            return false;
+
         try
         {
             AuthenticationResult result;
@@ -215,6 +239,9 @@ public class OneNoteService
     /// </summary>
     public async Task<bool> SaveCanvasToOneNoteAsync(InkCanvas canvas, string pageTitle)
     {
+        if (!EnsureInitialized() || _config == null)
+            return false;
+
         if (string.IsNullOrEmpty(_accessToken))
         {
             if (!await AuthenticateAsync())

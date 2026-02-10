@@ -216,6 +216,26 @@
                     </InkCanvas>
                 </Border>
                 
+                <!-- 日程提醒栏 -->
+                <Border x:Name="ScheduleBarBorder"
+                        VerticalAlignment="Bottom"
+                        HorizontalAlignment="Stretch"
+                        Background="#E01E1E1E"
+                        CornerRadius="0,0,5,5"
+                        Visibility="Collapsed"
+                        Panel.ZIndex="10">
+                    <StackPanel Orientation="Horizontal"
+                                Margin="10,6"
+                                HorizontalAlignment="Center">
+                        <TextBlock x:Name="ScheduleTimeText"
+                                   Text=""
+                                   Foreground="#FFD700"
+                                   FontSize="12"
+                                   VerticalAlignment="Center"
+                                   FontWeight="SemiBold"/>
+                    </StackPanel>
+                </Border>
+
                 <!-- 浮动控制栏 -->
                 <Border x:Name="FloatingToolbar"
                         VerticalAlignment="Top"
